@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import random
 import jax.numpy as jnp
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from Backprop.GAN_Models.mnist_data import get_mnist_loaders
 
 # Set Random Seeds for Reproducibility
