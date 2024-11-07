@@ -10,6 +10,7 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from Backprop.GAN_Models.mnist_data import get_mnist_loaders
+from ngclearn.utils.metric_utils import measure_MSE
 
 # Set Random Seeds for Reproducibility
 seed = 42
@@ -100,12 +101,58 @@ class RegularizedAutoencoder:
         if not preserve_batch:
             kld = jnp.mean(kld)
         return kld
+    
+    def eval_model(self, model, data_loader, mb_size, verbosity=1):
+        model.encoder.eval()
+        model.decoder.eval()
+        n_batches = len(data_loader)
+        n_samp_seen = 0
+        nll = 0.0
+        mse = 0.0
+        bce = 0.0
+        kld = 0.0
+
+        with torch.no_grad():
+            for i, (imgs, _) in enumerate(data_loader):
+                real_imgs = imgs.to(device)
+                z = model.encoder(real_imgs)
+                recon_imgs = model.decoder(z)
+
+                # Calculate reconstruction loss
+                loss = model.reconstruction_loss(recon_imgs, real_imgs)
+
+                # Convert tensors to numpy arrays for JAX calculations
+                recon_imgs_flat = recon_imgs.view(-1, 28*28).cpu().numpy()
+                real_imgs_flat = real_imgs.view(-1, 28*28).cpu().numpy()
+
+                _nll = model.negative_log_likelihood(recon_imgs_flat, real_imgs_flat) * real_imgs.shape[0]
+                _mse = measure_MSE(recon_imgs_flat, real_imgs_flat) * real_imgs.shape[0]
+                _bce = model.binary_cross_entropy(recon_imgs_flat, real_imgs_flat) * real_imgs.shape[0]
+                _kld = model.kullback_leibler_divergence(recon_imgs_flat, real_imgs_flat) * real_imgs.shape[0]
+
+                nll += _nll
+                mse += _mse
+                bce += _bce
+                kld += _kld
+
+                n_samp_seen += real_imgs.shape[0]
+                if verbosity > 0:
+                    print("\r NLL = {} MSE = {} BCE = {} KLD = {} ({} samples)".format(
+                        nll / n_samp_seen, mse / n_samp_seen, bce / n_samp_seen, kld / n_samp_seen, n_samp_seen), end="")
+            if verbosity > 0:
+                print()
+
+        nll = nll / n_samp_seen
+        mse = mse / n_samp_seen
+        bce = bce / n_samp_seen
+        kld = kld / n_samp_seen
+        return nll, mse, bce, kld
 
     def train(self, train_loader, num_epochs):
         train_losses = []
         
         # Initialize lists to hold individual loss metrics
-        nll_list, kld_list, bce_list = [], [], []
+        nll_list, kld_list, bce_list,mse_list = [], [], [],[]
 
         for epoch in range(num_epochs):
             self.encoder.train()
@@ -132,6 +179,7 @@ class RegularizedAutoencoder:
                 nll = self.negative_log_likelihood(recon_imgs_flat, real_imgs_flat)
                 kld = self.kullback_leibler_divergence(recon_imgs_flat, real_imgs_flat)
                 bce = self.binary_cross_entropy(recon_imgs_flat, real_imgs_flat)
+                mse = measure_MSE(recon_imgs_flat, real_imgs_flat)
 
                 # Backward pass and optimize
                 loss.backward()
@@ -144,12 +192,14 @@ class RegularizedAutoencoder:
                 nll_list.append(nll.item())
                 kld_list.append(kld.item())
                 bce_list.append(bce.item())
+                mse_list.append(mse.item())
 
                 # Print progress for each batch
                 if (i + 1) % 200 == 0:
                     print(f"Epoch [{epoch + 1}/{num_epochs}] Batch {i + 1}/{len(train_loader)} "
                           f"Loss: {loss.item():.4f} NLL: {nll.item():.4f} KLD: {kld.item():.4f} "
-                          f"BCE: {bce.item():.4f}")
+                          f"BCE: {bce.item():.4f} MSE: {mse.item():.4f}")
+
 
             train_losses.append(running_loss / len(train_loader))
 
@@ -157,15 +207,17 @@ class RegularizedAutoencoder:
             avg_nll = np.mean(nll_list)
             avg_kld = np.mean(kld_list)
             avg_bce = np.mean(bce_list)
+            avg_mse = np.mean(mse_list)
 
             print(f"Epoch [{epoch + 1}/{num_epochs}] "
                   f"Average Loss: {running_loss / len(train_loader):.4f}, "
                   f"Average NLL: {avg_nll:.4f}, "
                   f"Average KLD: {avg_kld:.4f}, "
-                  f"Average BCE: {avg_bce:.4f}")
+                  f"Average BCE: {avg_bce:.4f}, "
+                  f"Average MSE: {avg_mse:.4f}")
 
             # Reset lists for next epoch
-            nll_list, kld_list, bce_list = [], [], []
+            nll_list, kld_list, bce_list, mse_list = [], [], [],[]
 
             # Save reconstructed images every epoch
             self.save_reconstructed_images(recon_imgs, epoch)
@@ -201,40 +253,5 @@ rae = RegularizedAutoencoder(latent_dim)
 rae.train(train_loader, num_epochs)
 
 # Evaluation on test data
-rae.encoder.eval()
-rae.decoder.eval()
-test_loss = 0
-nll_list, kld_list, bce_list = [], [], []
-
-with torch.no_grad():
-    for imgs, _ in test_loader:
-        real_imgs = imgs.to(device)
-        z = rae.encoder(real_imgs)
-        recon_imgs = rae.decoder(z)
-
-        # Calculate test losses
-        test_loss += rae.reconstruction_loss(recon_imgs, real_imgs).item()
-
-        # Flatten images for loss calculations
-        recon_imgs_flat = recon_imgs.view(-1, 28*28).detach().cpu().numpy()
-        real_imgs_flat = real_imgs.view(-1, 28*28).detach().cpu().numpy()
-
-        # Calculate additional metrics
-        nll = rae.negative_log_likelihood(recon_imgs_flat, real_imgs_flat)
-        kld = rae.kullback_leibler_divergence(recon_imgs_flat, real_imgs_flat)
-        bce = rae.binary_cross_entropy(recon_imgs_flat, real_imgs_flat)
-
-        nll_list.append(nll.item())
-        kld_list.append(kld.item())
-        bce_list.append(bce.item())
-
-
-avg_test_loss = test_loss / len(test_loader)
-avg_nll_test = np.mean(nll_list) 
-avg_kld_test = np.mean(kld_list) 
-avg_bce_test = np.mean(bce_list)
-
-print(f"Test Results: Average Loss: {avg_test_loss:.4f}, "
-      f"Average NLL: {avg_nll_test:.4f}, "
-      f"Average KLD: {avg_kld_test:.4f}, "
-      f"Average BCE: {avg_bce_test:.4f}")
+nll, mse, bce, kld = rae.eval_model(rae, test_loader, mb_size=batch_size)
+print(f"Test Results: NLL: {nll:.4f}, MSE: {mse:.4f}, BCE: {bce:.4f}, KLD: {kld:.4f}")
